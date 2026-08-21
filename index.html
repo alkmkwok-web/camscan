@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Auto-Capture Targeted OCR</title>
+  <title>Targeted OCR - Auto & Manual Capture</title>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     * { box-sizing: border-box; }
@@ -21,7 +21,7 @@
 
     video { width: 100%; display: block; }
 
-    /* Target overlay changes color when device becomes still */
+    /* Target overlay turns green when still */
     .target-overlay {
       position: absolute;
       top: 50%;
@@ -29,7 +29,7 @@
       width: 75%;
       height: 20%;
       transform: translate(-50%, -50%);
-      border: 3px solid #ff4444; /* Default: Moving / Waiting */
+      border: 3px solid #ff4444;
       box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5);
       border-radius: 6px;
       pointer-events: none;
@@ -37,7 +37,26 @@
     }
 
     .target-overlay.stable {
-      border-color: #00ffcc; /* Still / Ready to scan */
+      border-color: #00ffcc;
+    }
+
+    /* Manual Scan Button */
+    .btn-container { margin-top: 15px; }
+    button {
+      padding: 12px 28px;
+      font-size: 1rem;
+      font-weight: bold;
+      background: #00ffcc;
+      color: #000;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: opacity 0.2s;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
     }
 
     #status { margin-top: 15px; color: #aaa; font-size: 0.9rem; }
@@ -46,23 +65,27 @@
 </head>
 <body>
 
-  <h2>Auto-Capture Scanner</h2>
+  <h2>Targeted OCR Scanner</h2>
 
   <div class="scanner-container">
     <video id="webcam" autoplay playsinline></video>
     <div id="targetBox" class="target-overlay"></div>
   </div>
 
-  <div id="status">Hold device still over text...</div>
+  <div class="btn-container">
+    <button id="manualScanBtn">Manual Scan</button>
+  </div>
+
+  <div id="status">Align text in box (Auto-scans when still or tap button)</div>
   <div id="result">Result: None</div>
 
-  <!-- Hidden canvases for OCR crop and low-res motion analysis -->
   <canvas id="cropCanvas" style="display:none;"></canvas>
   <canvas id="motionCanvas" style="display:none;" width="64" height="32"></canvas>
 
   <script>
     const video = document.getElementById('webcam');
     const targetBox = document.getElementById('targetBox');
+    const manualScanBtn = document.getElementById('manualScanBtn');
     const cropCanvas = document.getElementById('cropCanvas');
     const motionCanvas = document.getElementById('motionCanvas');
     const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
@@ -74,9 +97,8 @@
     let isProcessing = false;
     let scanCooldown = false;
 
-    // Configuration thresholds
-    const MOTION_THRESHOLD = 8.0;   // Max average pixel delta to consider "still"
-    const STILL_DURATION_MS = 500;  // How long camera must stay still before capture
+    const MOTION_THRESHOLD = 8.0;   
+    const STILL_DURATION_MS = 600;  
 
     async function startCamera() {
       try {
@@ -85,9 +107,7 @@
           audio: false
         });
         video.srcObject = stream;
-        video.onloadedmetadata = () => {
-          setInterval(checkMotion, 100); // Sample motion 10 times per second
-        };
+        video.onloadedmetadata = () => setInterval(checkMotion, 100);
       } catch (err) {
         const fallbackStream = await navigator.mediaDevices.getUserMedia({ video: true });
         video.srcObject = fallbackStream;
@@ -95,40 +115,27 @@
       }
     }
 
+    // Auto-capture motion check
     function checkMotion() {
       if (isProcessing || scanCooldown || !video.videoWidth) return;
 
-      const scaleX = video.videoWidth / video.clientWidth;
-      const scaleY = video.videoHeight / video.clientHeight;
-      const targetRect = targetBox.getBoundingClientRect();
-      const videoRect = video.getBoundingClientRect();
-
-      const cropX = (targetRect.left - videoRect.left) * scaleX;
-      const cropY = (targetRect.top - videoRect.top) * scaleY;
-      const cropWidth = targetRect.width * scaleX;
-      const cropHeight = targetRect.height * scaleY;
-
-      // Draw downscaled low-res sample of target area to measure frame differences cheaply
-      motionCtx.drawImage(video, cropX, cropY, cropWidth, cropHeight, 0, 0, 64, 32);
+      const cropCoords = getCropCoordinates();
+      motionCtx.drawImage(video, cropCoords.x, cropCoords.y, cropCoords.w, cropCoords.h, 0, 0, 64, 32);
       const currentFrame = motionCtx.getImageData(0, 0, 64, 32);
 
       if (prevFrameData) {
         const diff = calculateFrameDiff(prevFrameData.data, currentFrame.data);
 
         if (diff < MOTION_THRESHOLD) {
-          // Camera is currently holding still
           if (!stillStartTime) stillStartTime = Date.now();
           targetBox.classList.add('stable');
           
-          // Trigger scan if still duration exceeds set threshold
           if (Date.now() - stillStartTime >= STILL_DURATION_MS) {
-            triggerAutoScan(cropX, cropY, cropWidth, cropHeight);
+            captureAndScan("Auto");
           }
         } else {
-          // Camera moved — reset stability timer
           stillStartTime = null;
           targetBox.classList.remove('stable');
-          statusDiv.innerText = "Hold device still over target...";
         }
       }
 
@@ -137,24 +144,42 @@
 
     function calculateFrameDiff(data1, data2) {
       let totalDiff = 0;
-      // Sample RGB values across pixels
       for (let i = 0; i < data1.length; i += 4) {
-        totalDiff += Math.abs(data1[i] - data2[i]);         // Red channel
-        totalDiff += Math.abs(data1[i+1] - data2[i+1]);     // Green channel
-        totalDiff += Math.abs(data1[i+2] - data2[i+2]);     // Blue channel
+        totalDiff += Math.abs(data1[i] - data2[i]);
+        totalDiff += Math.abs(data1[i+1] - data2[i+1]);
+        totalDiff += Math.abs(data1[i+2] - data2[i+2]);
       }
       return totalDiff / (data1.length / 4);
     }
 
-    async function triggerAutoScan(cropX, cropY, cropWidth, cropHeight) {
-      isProcessing = true;
-      statusDiv.innerText = "Capturing & scanning...";
+    function getCropCoordinates() {
+      const scaleX = video.videoWidth / video.clientWidth;
+      const scaleY = video.videoHeight / video.clientHeight;
+      const targetRect = targetBox.getBoundingClientRect();
+      const videoRect = video.getBoundingClientRect();
 
-      // Draw full resolution cropped frame to OCR canvas
-      cropCanvas.width = cropWidth;
-      cropCanvas.height = cropHeight;
+      return {
+        x: (targetRect.left - videoRect.left) * scaleX,
+        y: (targetRect.top - videoRect.top) * scaleY,
+        w: targetRect.width * scaleX,
+        h: targetRect.height * scaleY
+      };
+    }
+
+    // Shared execution trigger (Works for both Manual Button & Auto-capture)
+    async function captureAndScan(source = "Manual") {
+      if (isProcessing || scanCooldown) return;
+
+      isProcessing = true;
+      manualScanBtn.disabled = true;
+      statusDiv.innerText = `Scanning (${source})...`;
+
+      const coords = getCropCoordinates();
+      cropCanvas.width = coords.w;
+      cropCanvas.height = coords.h;
+      
       const ctx = cropCanvas.getContext('2d');
-      ctx.drawImage(video, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+      ctx.drawImage(video, coords.x, coords.y, coords.w, coords.h, 0, 0, coords.w, coords.h);
 
       try {
         const worker = await Tesseract.createWorker('eng');
@@ -172,16 +197,20 @@
         statusDiv.innerText = "OCR scan failed.";
       }
 
-      // Add a brief cooldown period to prevent rapid repeated scans
+      // Cooldown before next scan allowed
       scanCooldown = true;
       setTimeout(() => {
         scanCooldown = false;
         isProcessing = false;
         stillStartTime = null;
+        manualScanBtn.disabled = false;
         targetBox.classList.remove('stable');
-        statusDiv.innerText = "Hold device still over text...";
-      }, 2500);
+        statusDiv.innerText = "Ready to scan (Hold still or tap button)";
+      }, 2000);
     }
+
+    // Event listener for manual scan
+    manualScanBtn.addEventListener('click', () => captureAndScan("Manual"));
 
     startCamera();
   </script>
